@@ -9,15 +9,23 @@ import multiprocessing
 import scipy.signal as sig
 from pyvital import arr
 
+from typing import Dict, Tuple, Optional
+import glob, re
+
 
 # Define saving path
 SAVE_PATH = "./dataset/"
 if not os.path.exists(SAVE_PATH):
     os.mkdir(SAVE_PATH)
 
+# Subfolders
+UNBIASED_TMP = os.path.join(SAVE_PATH, "random_selection_tmp")
+BIASED_TMP   = os.path.join(SAVE_PATH, "biased_selection_tmp")
+os.makedirs(UNBIASED_TMP, exist_ok=True)
+os.makedirs(BIASED_TMP,   exist_ok=True)
 
 # Define hyperparameters
-PREDICTION_WINDOW = [5, 10, 15]
+PREDICTION_WINDOW = [5]
 BATCH_SIZE = 512
 SRATE=100
 SEGMENT_SIZE = 1
@@ -121,402 +129,345 @@ def filter_abps(segx, SRATE=100):
 
     return (range_filter & mstds_filter)
 
+#=====Added Helpers============
+
+# Check already done cases
+def already_done_cases(tmp_dir, pred_min):
+    done = set()
+    for f in glob.glob(os.path.join(tmp_dir, f"{pred_min}min_*.pkl")):
+        m = re.search(rf"{pred_min}min_(\d+)\.pkl$", os.path.basename(f))
+        if m: done.add(int(m.group(1)))
+    return done
+
+# Cohort assignment helpers
+def _get_col(row: pd.Series, names) -> Optional[float]:
+    for n in names:
+        if n in row and pd.notna(row[n]):
+            return row[n]
+    return None
+
+def get_case_meta(case_id: int) -> Dict:
+    row = case_info_pd.loc[case_info_pd["caseid"] == case_id]
+    row = row.iloc[0] if len(row) else pd.Series(dtype=object)
+
+    asa = _get_col(row, ["asa", "ASA", "asa_class", "asaclass"])
+    # In VitalDB, emergency often appears as 'emop' (0/1). Fall back to other aliases if needed.
+    emergency = _get_col(row, ["emop", "emergency", "is_emergency"])
+    # Duration in minutes: if not in metadata, we’ll compute from waveform length lazily (see below)
+    duration_meta = _get_col(row, ["opdur", "duration_min", "duration"])
+
+    return {"asa": asa, "emergency": emergency, "duration_meta": duration_meta}
+
+def assign_cohort(asa: Optional[float], emergency: Optional[int], duration_min: float) -> str:
+    """A: clean (ASA<=2, non-emergency, dur>=60); B: inclusive (adds ASA>=3/emergency); C: real-world else."""
+    em = int(emergency) if emergency is not None and not pd.isna(emergency) else 0
+    asai = int(asa) if asa is not None and not pd.isna(asa) else 3  # if missing, treat as higher risk
+    if (asai <= 2) and (em == 0) and (duration_min >= 60.0):
+        return "A"  # selected/clean
+    if (asai >= 3) or (em == 1):
+        return "B"  # inclusive (higher risk and/or emergency)
+    return "C"      # remaining adult cases (real-world)
+
+def _append_buffers(buffers: Dict[str, Dict[str, list]],
+                    cohort: str,
+                    x, y, mbp, case_ids, asa_tags, emop_tags):
+    # Accumulate into per-cohort and pooled buffers
+    for key, arr_ in [("x", x), ("y", y), ("mbp", mbp), ("case", case_ids), ("asa", asa_tags), ("emop", emop_tags)]:
+        buffers["pooled"][key].append(arr_)
+        buffers[cohort][key].append(arr_)
+
+def _init_buffers() -> Dict[str, Dict[str, list]]:
+    def empty():
+        return {"x": [], "y": [], "mbp": [], "case": [], "asa": [], "emop": []}
+    return {"pooled": empty(), "A": empty(), "B": empty(), "C": empty()}
+
+def _finalize_and_save(buffers: Dict[str, Dict[str, list]], pred_min: int, tag: str):
+    # Stack numpy arrays and save per cohort + pooled
+    for cohort in ["pooled", "A", "B", "C"]:
+        if len(buffers[cohort]["y"]) == 0:
+            continue
+        X = np.vstack(buffers[cohort]["x"])
+        Y = np.concatenate(buffers[cohort]["y"])
+        M = np.vstack(buffers[cohort]["mbp"])
+        C = np.concatenate(buffers[cohort]["case"])
+        ASA = np.concatenate(buffers[cohort]["asa"])
+        EM  = np.concatenate(buffers[cohort]["emop"])
+
+        suffix = f"{tag}_{pred_min}min_{cohort}"
+        pickle.dump(X,   open(os.path.join(SAVE_PATH, f"x_{suffix}.np"),   "wb"), protocol=4)
+        pickle.dump(Y,   open(os.path.join(SAVE_PATH, f"y_{suffix}.np"),   "wb"), protocol=4)
+        pickle.dump(M,   open(os.path.join(SAVE_PATH, f"mbp_{suffix}.np"), "wb"), protocol=4)
+        pickle.dump(C,   open(os.path.join(SAVE_PATH, f"c_{suffix}.np"),   "wb"), protocol=4)
+        pickle.dump(ASA, open(os.path.join(SAVE_PATH, f"asa_{suffix}.np"), "wb"), protocol=4)
+        pickle.dump(EM,  open(os.path.join(SAVE_PATH, f"emop_{suffix}.np"),"wb"), protocol=4)
+
+def _case_duration_minutes_from_wave(art_wav_len: int) -> float:
+    # duration of whole waveform in minutes (at SRATE Hz)
+    return art_wav_len / SRATE / 60.0
+
 
 ######################################
 # 01. Build random selection dataset #
 ######################################
 
-print('Start building random selection datasets')
+# Modified into functions with added helpers
+def build_unbiased_random(pred_min: int, case_summary_rows: list):
+    print(f"[UNBIASED] Building for prediction window = {pred_min} min")
+    buffers = _init_buffers()
 
-for pred_win in PREDICTION_WINDOW:
-    print("Building for prediction window of {}".format(str(int(pred_win))))
-
-    x = np.empty((0, 6000), float)
-    y = np.array([])
-    m = np.empty((0, 30), float)
-    c = np.array([])
-
-    for caseid in tqdm.tqdm(eligible_caseids):
-
-        print('Start processing {}'.format(caseid))
-
-        if not os.path.exists(os.path.join(SAVE_PATH, 'random_selection_tmp')):
-            os.makedirs(os.path.join(SAVE_PATH, 'random_selection_tmp'))
-
-        tmp_filename = os.path.join(SAVE_PATH, 'random_selection_tmp', '{}min_pred_{}_np.tmp'.format(str(int(pred_win)), str(caseid).zfill(4)))
-
+    done = already_done_cases(UNBIASED_TMP, pred_min)   # or BIASED_TMP
+    for caseid in tqdm.tqdm([c for c in eligible_caseids if c not in done]):
+        tmp_filename = os.path.join(UNBIASED_TMP, f"{pred_min}min_{str(caseid).zfill(4)}.pkl")
         if not os.path.exists(tmp_filename):
+            try:
+                vf = vitaldb.VitalFile(caseid, ["SNUADC/ART", "Solar8000/ART_MBP"])
+                wav, mbp = vf.get_samples(["SNUADC/ART", "Solar8000/ART_MBP"], interval=1/SRATE)[0]
+            except Exception:
+                continue
 
-            vf = vitaldb.VitalFile(caseid, ['SNUADC/ART', 'Solar8000/ART_MBP'])
-            vf_arts = vf.get_samples(['SNUADC/ART', 'Solar8000/ART_MBP'], interval=1 / SRATE)
-            art_wav = vf_arts[0][0]
-            art_mbp = vf_arts[0][1]
+            # unbiased selection: scan timeline with stride SKIP_INTERVAL, take 1-minute window ending pred_min before index
+            selection_arange = np.arange(SRATE * (SEGMENT_SIZE + pred_min) * 60,
+                                         len(wav),
+                                         SRATE * 60 * SKIP_INTERVAL)
 
-            # INPUT_SEGMENT_SIZE=1, SKIP_INTERVAL=1 / Get extraction index
-            selection_arange = np.arange(SRATE * (SEGMENT_SIZE + pred_win) * 60,
-                                         len(art_wav), 60 * (SKIP_INTERVAL) * SRATE)
-
-            # select eligible wave
-            eligible_wave_position = []
-            for index in selection_arange:
-                # wave is from  1min length segment of 5-min ahead waveform
-                wave = art_wav[index - (SRATE * (SEGMENT_SIZE + pred_win) * 60):index - (SRATE * pred_win * 60)]
-
+            # eligible wave positions after basic QC
+            eligible_positions = []
+            for idx in selection_arange:
+                wave = wav[idx - (SRATE * (SEGMENT_SIZE + pred_min) * 60) : idx - (SRATE * pred_min * 60)]
                 valid = True
-
-                if np.isnan(wave).mean() > 0.1:
-                    valid = False
-                elif (wave > 200).any():
-                    valid = False
-                elif (wave < 20).any():
-                    valid = False
-                elif np.max(wave) - np.min(wave) < 30:
-                    valid = False
-                elif (np.abs(np.diff(wave)) > 30).any():  # abrupt change -> noise
-                    valid = False
-
-                if valid:
-                    eligible_wave_position.append(index)
-
-            if len(eligible_wave_position) == 0:
+                if np.isnan(wave).mean() > 0.1: valid = False
+                elif (wave > 200).any():        valid = False
+                elif (wave < 20).any():         valid = False
+                elif np.max(wave) - np.min(wave) < 30: valid = False
+                elif (np.abs(np.diff(wave)) > 30).any(): valid = False
+                if valid: eligible_positions.append(idx)
+            if len(eligible_positions) == 0:
                 continue
 
-            eligible_case_position = []
-            eligible_control_position = []
+            # case/control labeling by recent 1-min MBP mean
+            case_pos, ctrl_pos = [], []
+            for idx in eligible_positions:
+                seg_mbp = mbp[idx - (SRATE * CASE_DURATION * 60): idx]
+                seg_mbp = seg_mbp[~np.isnan(seg_mbp)]
+                if len(seg_mbp) == 0:  # skip empty
+                    continue
+                if (seg_mbp > 200).any() or (seg_mbp < 30).any() or (np.abs(np.diff(seg_mbp)) > 30).any():
+                    continue
+                is_case = (np.mean(seg_mbp) <= 65.0)
+                (case_pos if is_case else ctrl_pos).append(idx)
 
-            for index in eligible_wave_position:
+            seg_x, seg_y, seg_m = [], [], []
+            for idx in case_pos + ctrl_pos:
+                x = wav[idx - (SRATE * (SEGMENT_SIZE + pred_min) * 60) : idx - (SRATE * pred_min * 60)]
+                y = 1.0 if idx in case_pos else 0.0
+                m = mbp[idx - (SRATE * (SEGMENT_SIZE + pred_min) * 60) : idx - (SRATE * pred_min * 60)]
+                m = m[~np.isnan(m)]
+                if len(x) != 6000: x = np.full(6000, np.nan)
+                if len(m) != 30:   m = np.full(30,   np.nan)
+                seg_x.append(x); seg_y.append(y); seg_m.append(m)
 
-                # select mbp segment
-                mbp = art_mbp[index - (SRATE * CASE_DURATION * 60):index]
-                mbp_notnull = mbp[~np.isnan(mbp)]
-
-                # select eligible mbp
-                valid = True
-                if (mbp_notnull > 200).any():
-                    valid = False
-                elif (mbp_notnull < 30).any():
-                    valid = False
-                elif (np.abs(np.diff(mbp_notnull)) > 30).any():  # abrupt change -> noise
-                    valid = False
-
-                # assign case/control
-                mbp_is_case = np.mean(mbp_notnull) <= 65.
-
-                if valid & mbp_is_case:
-                    eligible_case_position.append(index)
-
-                if valid & (not mbp_is_case):
-                    eligible_control_position.append(index)
-
-            if len(eligible_case_position) == 0 and len(eligible_control_position) == 0:
-                print('case dose not have eligible points, skip this case')
+            if len(seg_x) == 0:
                 continue
 
-            # select case segments
-            seg_x, seg_y, seg_mbp = [], [], []
-            for case_idx in eligible_case_position:
-                sample_x = art_wav[
-                           case_idx - (SRATE * (SEGMENT_SIZE + pred_win) * 60):case_idx - (SRATE * pred_win * 60)]
-                sample_y = 1.
-                sample_mbp = art_mbp[
-                             case_idx - (SRATE * (SEGMENT_SIZE + pred_win) * 60):case_idx - (SRATE * pred_win * 60)]
-                sample_mbp_notnull = sample_mbp[~np.isnan(sample_mbp)]
+            # cohort metadata
+            meta = get_case_meta(caseid)
+            duration_min = meta["duration_meta"] if meta["duration_meta"] is not None else _case_duration_minutes_from_wave(len(wav))
+            cohort = assign_cohort(meta["asa"], meta["emergency"], float(duration_min))
+            asa_tag = int(meta["asa"]) if meta["asa"] is not None and not pd.isna(meta["asa"]) else -1
+            em_tag  = int(meta["emergency"]) if meta["emergency"] is not None and not pd.isna(meta["emergency"]) else 0
 
-                if len(sample_x) != 6000:
-                    sample_x = np.array([np.nan] * 6000)
-                if len(sample_mbp_notnull) != 30:
-                    sample_mbp_notnull = np.array([np.nan] * 30)
-
-                seg_x.append(sample_x)
-                seg_y.append(sample_y)
-                seg_mbp.append(sample_mbp_notnull)
-
-            # select control segments
-            for control_idx in eligible_control_position:
-                sample_x = art_wav[
-                           control_idx - (SRATE * (SEGMENT_SIZE + pred_win) * 60):control_idx - (SRATE * pred_win * 60)]
-                sample_y = 0.
-                sample_mbp = art_mbp[control_idx - (SRATE * (SEGMENT_SIZE + pred_win) * 60):control_idx - (
-                            SRATE * pred_win * 60)]
-                sample_mbp_notnull = sample_mbp[~np.isnan(sample_mbp)]
-
-                if len(sample_x) != 6000:
-                    sample_x = np.array([np.nan] * 6000)
-                if len(sample_mbp_notnull) != 30:
-                    sample_mbp_notnull = np.array([np.nan] * 30)
-
-                seg_x.append(sample_x)
-                seg_y.append(sample_y)
-                seg_mbp.append(sample_mbp_notnull)
-
-            seg_x_np = np.array(seg_x)
-            seg_y_np = np.array(seg_y)
-            seg_mbp_np = np.array(seg_mbp)
-            seg_c_np = np.array([caseid] * len(seg_y))
-
-            pickle.dump((seg_x_np, seg_y_np, seg_mbp_np, seg_c_np,), open(tmp_filename, 'wb'), protocol=4)
-
-            if len(seg_x_np) == 0 or len(seg_y_np) == 0 or len(seg_mbp_np) == 0:
-                continue
+            # persist tmp for restartability
+            payload = (np.array(seg_x), np.array(seg_y), np.array(seg_m), np.array([caseid]*len(seg_y)),
+                       np.full(len(seg_y), asa_tag), np.full(len(seg_y), em_tag), cohort, duration_min)
+            pickle.dump(payload, open(tmp_filename, "wb"), protocol=4)
         else:
-            seg_x_np, seg_y_np, seg_mbp_np, seg_c_np = pickle.load(open(tmp_filename, 'rb'))
-
-            if len(seg_x_np) == 0 or len(seg_y_np) == 0 or len(seg_mbp_np) == 0:
+            try:
+                payload = pickle.load(open(tmp_filename, "rb"))
+            except Exception:
                 continue
 
-        x = np.append(x, seg_x_np, axis=0)
-        y = np.concatenate([y, seg_y_np])
-        m = np.append(m, seg_mbp_np, axis=0)
-        c = np.concatenate([c, seg_c_np])
+        seg_x_np, seg_y_np, seg_m_np, seg_c_np, seg_asa_np, seg_em_np, cohort, duration_min = payload
 
+        # waveform QC by beats
+        nproc = min(20, os.cpu_count() or 4)
+        with multiprocessing.Pool(processes=nproc) as pool:
+            keep = pool.map(filter_abps, list(seg_x_np))
+        keep = np.array(keep, dtype=bool)
+        if not keep.any():
+            continue
 
-    print("Start preprocessing of waveform")
-    n_process = 20
-    pool = multiprocessing.Pool(processes=n_process)
-    filter_random_sample = pool.map(filter_abps, list(x))
-    pool.close()
-    pool.join()
+        X = seg_x_np[keep]; Y = seg_y_np[keep]; M = seg_m_np[keep]
+        C = seg_c_np[keep];  ASA = seg_asa_np[keep]; EM = seg_em_np[keep]
 
-    x = x[filter_random_sample]
-    y = y[filter_random_sample]
-    c = c[filter_random_sample]
-    m = m[filter_random_sample]
+        # append to buffers (pooled + cohort)
+        _append_buffers(buffers, cohort, X, Y, M, C, ASA, EM)
 
-    pickle.dump(x, open(
-        os.path.join(SAVE_PATH, 'x_random_selection_{}min_pred.np'.format(str(int(pred_win)))), 'wb'), protocol=4)
-    pickle.dump(y, open(
-        os.path.join(SAVE_PATH, 'y_random_selection_{}min_pred.np'.format(str(int(pred_win)))), 'wb'), protocol=4)
-    pickle.dump(m, open(
-        os.path.join(SAVE_PATH, 'mbp_random_selection_{}min_pred.np'.format(str(int(pred_win)))), 'wb'), protocol=4)
-    pickle.dump(c, open(
-        os.path.join(SAVE_PATH, 'c_random_selection_{}min_pred.np'.format(str(int(pred_win)))), 'wb'), protocol=4)
+        # add 1 case-level summary row
+        case_summary_rows.append({
+            "caseid": int(C[0]),
+            "cohort": cohort,
+            "asa":    int(ASA[0]),
+            "emop":   int(EM[0]),
+            "duration_min": float(duration_min),
+            "n_samples": int(len(Y)),
+            "pos_rate": float(Y.mean()) if len(Y) else np.nan,
+            "builder": "unbiased",
+            "pred_min": pred_min
+        })
 
-    del (x)
-    del (y)
-    del (m)
-    del (c)
-    gc.collect()
-
-    print('end building prediction window {}min dataset'.format(str(int(pred_win))))
-    print(' ')
-
-print('end building random sample dataset')
-print(' ')
-print(' ')
-
+    # save per-cohort + pooled
+    _finalize_and_save(buffers, pred_min, tag="unbiased")
 
 
 ######################################
 # 02. Build Biased selection dataset #
 ######################################
 
-print('Start building hpi_style datasets')
+# Modified into functions with added helpers
+def build_biased_hpi_style(pred_min: int, case_summary_rows: list):
+    print(f"[BIASED] Building for prediction window = {pred_min} min")
+    buffers = _init_buffers()
 
-for pred_win in PREDICTION_WINDOW:
-    print("Building for prediction window of {}".format(str(int(pred_win))))
-
-    x_hpi_style = np.empty((0, 6000), float)
-    y_hpi_style = np.array([])
-    mbp_hpi_style = np.empty((0, 30), float)
-    c_hpi_style = np.array([])
-
-    for caseid in tqdm.tqdm(eligible_caseids):
-
-        print('Start processing {}'.format(caseid))
-
-        if not os.path.join(SAVE_PATH, 'biased_selection_tmp'):
-            os.makedirs(os.path.join(SAVE_PATH, 'biased_selection_tmp'))
-
-        tmp_filename = os.path.join(SAVE_PATH, 'biased_selection_tmp', '{}min_pred_{}'.format(str(int(pred_win)), str(caseid).zfill(4)))
-
+    done = already_done_cases(BIASED_TMP, pred_min)
+    for caseid in tqdm.tqdm([c for c in eligible_caseids if c not in done]):
+        tmp_filename = os.path.join(BIASED_TMP, f"{pred_min}min_{str(caseid).zfill(4)}.pkl")
         if not os.path.exists(tmp_filename):
-
-            vf = vitaldb.VitalFile(caseid, ['SNUADC/ART', 'Solar8000/ART_MBP'])
-            vf_arts = vf.get_samples(['SNUADC/ART', 'Solar8000/ART_MBP'], interval=1 / SRATE)
-            art_wav = vf_arts[0][0]
-            art_mbp = vf_arts[0][1]
-
-            # INPUT_SEGMENT_SIZE=1, SKIP_INTERVAL=1 / Get extraction index
-            selection_arange = np.arange(SRATE * (SEGMENT_SIZE + pred_win) * 60,
-                                         len(art_wav) - (SRATE * CONTROL_DURATION * 60), 60 * SKIP_INTERVAL * SRATE)
-
-            # select eligible wave
-            eligible_wave_position = []
-            for index in selection_arange:
-                # wave is from  1min length segment of 5-min ahead waveform
-                wave = art_wav[index - (SRATE * (SEGMENT_SIZE + pred_win) * 60):index - (
-                            SRATE * pred_win * 60)]
-
-                valid = True
-
-                if np.isnan(wave).mean() > 0.1:
-                    valid = False
-                elif (wave > 200).any():
-                    valid = False
-                elif (wave < 30).any():
-                    valid = False
-                elif np.max(wave) - np.min(wave) < 30:
-                    valid = False
-                elif (np.abs(np.diff(wave)) > 30).any():  # abrupt change -> noise
-                    valid = False
-
-                if valid:
-                    eligible_wave_position.append(index)
-
-            if len(eligible_wave_position) == 0:
+            try:
+                vf = vitaldb.VitalFile(caseid, ["SNUADC/ART", "Solar8000/ART_MBP"])
+                wav, mbp = vf.get_samples(["SNUADC/ART", "Solar8000/ART_MBP"], interval=1/SRATE)[0]
+            except Exception:
                 continue
 
-            # select mbp segment of CASE event
-            eligible_case_position = []
-            for index in eligible_wave_position:
+            selection_arange = np.arange(SRATE * (SEGMENT_SIZE + pred_min) * 60,
+                                         len(wav) - (SRATE * CONTROL_DURATION * 60),
+                                         SRATE * 60 * SKIP_INTERVAL)
 
-                # select recent CASE_DURATION of mbp for CASE
-                mbp = art_mbp[index - (SRATE * CASE_DURATION * 60):index]
-                mbp_notnull = mbp[~np.isnan(mbp)]
-
-                # eligible mbp?
+            eligible_positions = []
+            for idx in selection_arange:
+                wave = wav[idx - (SRATE * (SEGMENT_SIZE + pred_min) * 60) : idx - (SRATE * pred_min * 60)]
                 valid = True
-                if (mbp_notnull > 200).any():
-                    valid = False
-                elif (mbp_notnull < 30).any():
-                    valid = False
-                elif (np.abs(np.diff(mbp_notnull)) > 30).any():  # abrupt change -> noise
-                    valid = False
+                if np.isnan(wave).mean() > 0.1: valid = False
+                elif (wave > 200).any():        valid = False
+                elif (wave < 30).any():         valid = False
+                elif np.max(wave) - np.min(wave) < 30: valid = False
+                elif (np.abs(np.diff(wave)) > 30).any(): valid = False
+                if valid: eligible_positions.append(idx)
+            if len(eligible_positions) == 0:
+                continue
 
-                # assign case?
-                mbp_is_case = np.mean(mbp_notnull) <= 65.
+            # CASE positions by recent 1-min mbp
+            case_pos = []
+            for idx in eligible_positions:
+                seg_mbp = mbp[idx - (SRATE * CASE_DURATION * 60): idx]
+                seg_mbp = seg_mbp[~np.isnan(seg_mbp)]
+                if len(seg_mbp) == 0: continue
+                if (seg_mbp > 200).any() or (seg_mbp < 30).any() or (np.abs(np.diff(seg_mbp)) > 30).any():
+                    continue
+                if (np.mean(seg_mbp) <= 65.0):
+                    case_pos.append(idx)
 
-                if valid & mbp_is_case:
-                    eligible_case_position.append(index)
-
-
-            # select mbp segment of control, considering CASE event
-            # mbp > 75mmHg lasting for 5min, 20min apart from CASE event
-            eligible_control_position = []
-
-            for index in eligible_wave_position:
-                # select recent CONTROL_DURATION of mbp for CONTROL
-                mbp = art_mbp[index:index + (SRATE * CONTROL_DURATION * 60)]
-                mbp_notnull = mbp[~np.isnan(mbp)]
-
-                # elibile mbp?
+            # CONTROL positions: MBP >= 75 for CONTROL_DURATION and apart >= 20 min from any case
+            ctrl_pos = []
+            for idx in eligible_positions:
+                seg = mbp[idx: idx + (SRATE * CONTROL_DURATION * 60)]
+                seg = seg[~np.isnan(seg)]
+                if len(seg) == 0: continue
                 valid = True
-                if (mbp_notnull > 200).any():
+                if (seg > 200).any() or (seg < 30).any() or (np.abs(np.diff(seg)) > 30).any():
                     valid = False
-                elif (mbp_notnull < 30).any():
-                    valid = False
-                elif (np.abs(np.diff(mbp_notnull)) > 30).any():  # abrupt change -> noise
-                    valid = False
-
-                # assign control?
-                mbp_is_normotension = np.array(mbp_notnull >= 75).all()
-
-                if len(eligible_case_position) == 0:
-                    mbp_is_control = True
+                is_normo = bool((seg >= 75).all())
+                if len(case_pos) == 0:
+                    is_apart = True
                 else:
-                    gap_with_case = np.array(eligible_case_position) - index
-                    # consider 21min ahead, and 25min behind, which considering 20min apart rule and length of input segment
-                    mbp_is_apart_20min = ((gap_with_case > (SRATE * (CONTROL_DURATION + CONTROL_APART) * 60)) | (
-                                gap_with_case < -(SRATE * (CASE_DURATION + CONTROL_APART) * 60))).all()
+                    gaps = np.array(case_pos) - idx
+                    is_apart = ((gaps > (SRATE * (CONTROL_DURATION + CONTROL_APART) * 60)) |
+                                (gaps < -(SRATE * (CASE_DURATION + CONTROL_APART) * 60))).all()
+                is_ctrl = valid and is_normo and is_apart
+                if is_ctrl:
+                    ctrl_pos.append(idx)
 
-                    mbp_is_control = mbp_is_normotension & mbp_is_apart_20min
+            seg_x, seg_y, seg_m = [], [], []
+            # cases
+            for idx in case_pos:
+                x = wav[idx - (SRATE * (SEGMENT_SIZE + pred_min) * 60) : idx - (SRATE * pred_min * 60)]
+                y = 1.0
+                m = mbp[idx - (SRATE * (SEGMENT_SIZE + pred_min) * 60) : idx - (SRATE * pred_min * 60)]
+                m = m[~np.isnan(m)]
+                if len(x) != 6000: x = np.full(6000, np.nan)
+                if len(m) != 30:   m = np.full(30,   np.nan)
+                seg_x.append(x); seg_y.append(y); seg_m.append(m)
+            # controls (centered)
+            for idx in ctrl_pos:
+                lo = idx + int(SRATE * (pred_min/2 - SEGMENT_SIZE/2) * 60)
+                hi = idx + int(SRATE * (pred_min/2 + SEGMENT_SIZE/2) * 60)
+                x = wav[lo:hi]
+                y = 0.0
+                m = mbp[lo:hi]
+                m = m[~np.isnan(m)]
+                if len(x) != 6000: x = np.full(6000, np.nan)
+                if len(m) != 30:   m = np.full(30,   np.nan)
+                seg_x.append(x); seg_y.append(y); seg_m.append(m)
 
-                if valid & mbp_is_control:
-                    eligible_control_position.append(index)
-
-
-            # select case segments
-            seg_x, seg_y, seg_mbp = [], [], []
-            for case_idx in eligible_case_position:
-                sample_x = art_wav[case_idx - (SRATE * (SEGMENT_SIZE + pred_win) * 60):case_idx - (
-                            SRATE * pred_win * 60)]
-                sample_y = 1.
-                sample_mbp = art_mbp[case_idx - (SRATE * (SEGMENT_SIZE + pred_win) * 60):case_idx - (
-                            SRATE * pred_win * 60)]
-                sample_mbp_notnull = sample_mbp[~np.isnan(sample_mbp)]
-
-                if len(sample_x) != 6000:
-                    sample_x = np.array([np.nan] * 6000)
-                if len(sample_mbp_notnull) != 30:
-                    sample_mbp_notnull = np.array([np.nan] * 30)
-
-                seg_x.append(sample_x)
-                seg_y.append(sample_y)
-                seg_mbp.append(sample_mbp_notnull)
-
-            # select control segment
-            for control_idx in eligible_control_position:
-                # extract the center point of 5-min control segment, index + 2.5min - 0.5min ~ index + 2.5min + 0.5min
-                sample_x = art_wav[
-                           control_idx + int(SRATE * (pred_win / 2 - SEGMENT_SIZE / 2) * 60):control_idx + int(
-                               SRATE * (pred_win / 2 + SEGMENT_SIZE / 2) * 60)]
-                sample_y = 0.
-                sample_mbp = art_mbp[control_idx + int(
-                    SRATE * (pred_win / 2 - SEGMENT_SIZE / 2) * 60):control_idx + int(
-                    SRATE * (pred_win / 2 + SEGMENT_SIZE / 2) * 60)]
-                sample_mbp_notnull = sample_mbp[~np.isnan(sample_mbp)]
-
-                if len(sample_x) != 6000:
-                    sample_x = np.array([np.nan] * 6000)
-                if len(sample_mbp_notnull) != 30:
-                    sample_mbp_notnull = np.array([np.nan] * 30)
-
-                seg_x.append(sample_x)
-                seg_y.append(sample_y)
-                seg_mbp.append(sample_mbp_notnull)
-
-            seg_x_np = np.array(seg_x)
-            seg_y_np = np.array(seg_y)
-            seg_mbp_np = np.array(seg_mbp)
-            seg_c_np = np.array([caseid] * len(seg_y))
-
-            pickle.dump((seg_x_np, seg_y_np, seg_mbp_np, seg_c_np,), open(tmp_filename, 'wb'), protocol=4)
-
-            if len(seg_x_np) == 0 or len(seg_y_np) == 0 or len(seg_mbp_np) == 0:
+            if len(seg_x) == 0:
                 continue
 
+            # cohort meta
+            meta = get_case_meta(caseid)
+            duration_min = meta["duration_meta"] if meta["duration_meta"] is not None else _case_duration_minutes_from_wave(len(wav))
+            cohort = assign_cohort(meta["asa"], meta["emergency"], float(duration_min))
+            asa_tag = int(meta["asa"]) if meta["asa"] is not None and not pd.isna(meta["asa"]) else -1
+            em_tag  = int(meta["emergency"]) if meta["emergency"] is not None and not pd.isna(meta["emergency"]) else 0
+
+            payload = (np.array(seg_x), np.array(seg_y), np.array(seg_m), np.array([caseid]*len(seg_y)),
+                       np.full(len(seg_y), asa_tag), np.full(len(seg_y), em_tag), cohort, duration_min)
+            pickle.dump(payload, open(tmp_filename, "wb"), protocol=4)
         else:
-            seg_x_np, seg_y_np, seg_mbp_np, seg_c_np = pickle.load(open(tmp_filename, 'rb'))
-
-            if len(seg_x_np) == 0 or len(seg_y_np) == 0 or len(seg_mbp_np) == 0:
+            try:
+                payload = pickle.load(open(tmp_filename, "rb"))
+            except Exception:
                 continue
 
-        x_hpi_style = np.append(x_hpi_style, seg_x_np, axis=0)
-        y_hpi_style = np.concatenate([y_hpi_style, seg_y_np])
-        mbp_hpi_style = np.append(mbp_hpi_style, seg_mbp_np, axis=0)
-        c_hpi_style = np.concatenate([c_hpi_style, seg_c_np])
+        seg_x_np, seg_y_np, seg_m_np, seg_c_np, seg_asa_np, seg_em_np, cohort, duration_min = payload
 
-    print("Start preprocessing of waveform")
-    n_process = 20
-    pool = multiprocessing.Pool(processes=n_process)
-    filter_random_sample = pool.map(filter_abps, list(x_hpi_style))
-    pool.close()
-    pool.join()
+        # waveform QC
+        nproc = min(20, os.cpu_count() or 4)
+        with multiprocessing.Pool(processes=nproc) as pool:
+            keep = pool.map(filter_abps, list(seg_x_np))
+        keep = np.array(keep, dtype=bool)
+        if not keep.any():
+            continue
 
-    x_hpi_style = x_hpi_style[filter_random_sample]
-    y_hpi_style = y_hpi_style[filter_random_sample]
-    c_hpi_style = c_hpi_style[filter_random_sample]
-    mbp_hpi_style = mbp_hpi_style[filter_random_sample]
+        X = seg_x_np[keep]; Y = seg_y_np[keep]; M = seg_m_np[keep]
+        C = seg_c_np[keep];  ASA = seg_asa_np[keep]; EM = seg_em_np[keep]
 
-    pickle.dump(x_hpi_style, open(
-        os.path.join(SAVE_PATH, 'x_biased_selection_{}min_pred.np'.format(str(int(pred_win)))), 'wb'), protocol=4)
-    pickle.dump(y_hpi_style, open(
-        os.path.join(SAVE_PATH, 'y_biased_selection_{}min_pred.np'.format(str(int(pred_win)))), 'wb'), protocol=4)
-    pickle.dump(mbp_hpi_style, open(
-        os.path.join(SAVE_PATH, 'mbp_biased_selection_{}min_pred.np'.format(str(int(pred_win)))), 'wb'), protocol=4)
-    pickle.dump(c_hpi_style, open(
-        os.path.join(SAVE_PATH, 'c_biased_selection_{}min_pred.np'.format(str(int(pred_win)))), 'wb'), protocol=4)
+        _append_buffers(buffers, cohort, X, Y, M, C, ASA, EM)
 
-    del (x_hpi_style)
-    del (y_hpi_style)
-    del (mbp_hpi_style)
-    del (c_hpi_style)
-    gc.collect()
+        case_summary_rows.append({
+            "caseid": int(C[0]),
+            "cohort": cohort,
+            "asa":    int(ASA[0]),
+            "emop":   int(EM[0]),
+            "duration_min": float(duration_min),
+            "n_samples": int(len(Y)),
+            "pos_rate": float(Y.mean()) if len(Y) else np.nan,
+            "builder": "biased",
+            "pred_min": pred_min
+        })
 
-    print('end building prediction window {}min dataset'.format(str(int(pred_win))))
-    print(' ')
+    _finalize_and_save(buffers, pred_min, tag="biased")
 
-print('end building hpi style dataset')
-print(' ')
-print(' ')
+if __name__ == "__main__":
+    case_summary_rows = []
+    for pred in PREDICTION_WINDOW:
+        build_unbiased_random(pred, case_summary_rows)
+        gc.collect()
+        build_biased_hpi_style(pred, case_summary_rows)
+        gc.collect()
 
+    # Write a case-level summary for reporting bias/imbalance
+    if len(case_summary_rows):
+        summary_df = pd.DataFrame(case_summary_rows)
+        summary_df.to_csv(os.path.join(SAVE_PATH, "cohort_case_summary.csv"), index=False)
+        print("Wrote per-case summary to dataset/cohort_case_summary.csv")
+
+    print("Done.")
