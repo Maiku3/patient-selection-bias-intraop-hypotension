@@ -212,7 +212,7 @@ def training_and_testing(
         if not os.path.exists(run_dir):
             os.makedirs(run_dir)
 
-        output_tmp = os.path.join(run_dir, "weights.h5")
+        output_tmp = os.path.join(run_dir, "weights.weights.h5")
 
         class_weights_arr = class_weight.compute_class_weight(
             "balanced", classes=np.unique(y_train), y=y_train
@@ -463,7 +463,7 @@ def training_and_testing(
             model = ut.load_lstm_model_architecture_3channel(
                 sample_x=x_test_total
             )
-            output_tmp = os.path.join(run_dir, "weights.h5")
+            output_tmp = os.path.join(run_dir, "weights.weights.h5")
 
             class_weights_arr = class_weight.compute_class_weight(
                 class_weight="balanced", classes=np.unique(y_train), y=y_train
