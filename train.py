@@ -606,6 +606,24 @@ for model_type, pred_win, samp_rate, selection_type, cohort in list_combination:
     if not os.path.exists(result_saving_dir):
         os.makedirs(result_saving_dir)
 
+    # ---------- NEW: resume/skip logic ----------
+    subdirectory = "{}_{}_predwin_{}_sampling_{}".format(
+        selection_type,
+        cohort,
+        int(pred_win),
+        str(samp_rate).replace(".", ""),
+    )
+    run_dir = os.path.join(result_saving_dir, subdirectory)
+    scores_path = os.path.join(
+        run_dir,
+        "test_on_same_dataset_used_in_train",
+        "scores_with_ci.txt",
+    )
+
+    if os.path.exists(scores_path):
+        print(f"[SKIP] Already finished {model_type} / {subdirectory}")
+        continue
+
     training_and_testing(
         data_selection_method=selection_type,
         fixed_test_case_path=fixed_testcase,
@@ -668,6 +686,26 @@ for kf in range(10):
         result_saving_dir = "./outputs/{}".format(model_type)
         if not os.path.exists(result_saving_dir):
             os.makedirs(result_saving_dir)
+
+        # ---------- NEW: resume/skip logic for k-fold ----------
+        subdirectory = "{}_{}_predwin_{}_sampling_{}_kf{}".format(
+            selection_type,
+            cohort,
+            int(pred_win),
+            str(samp_rate).replace(".", ""),
+            int(kf),
+        )
+
+        run_dir = os.path.join(result_saving_dir, subdirectory)
+        scores_path = os.path.join(
+            run_dir,
+            "test_on_same_dataset_used_in_train",
+            "scores_with_ci.txt",
+        )
+
+        if os.path.exists(scores_path):
+            print(f"[SKIP] Already finished fold {kf} / {model_type} / {subdirectory}")
+            continue
 
         training_and_testing(
             data_selection_method=selection_type,
