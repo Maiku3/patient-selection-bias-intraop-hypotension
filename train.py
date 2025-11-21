@@ -32,18 +32,20 @@ def evaluate(model_predict, y_test, plot_directory):
     if not os.path.exists(plot_directory):
         os.makedirs(plot_directory)
 
+    y_true = np.asarray(y_test).ravel()
+    model_predict = np.asarray(model_predict).ravel()
     model_result_inclass = np.greater(model_predict, 0.5)
 
     with open(os.path.join(plot_directory, "classification_report.txt"), "w") as f:
         print(
             classification_report(
-                y_test, model_result_inclass, target_names=["normal", "lowbp"]
+                y_true, model_result_inclass, target_names=["normal", "lowbp"]
             ),
             file=f,
         )
 
     # AUROC
-    fpr, tpr, thresh = roc_curve(y_test, model_predict)
+    fpr, tpr, thresh = roc_curve(y_true, model_predict)
     roc_auc = auc(fpr, tpr)
 
     plt.plot(fpr, tpr)
@@ -59,7 +61,7 @@ def evaluate(model_predict, y_test, plot_directory):
     plt.close()
 
     # AUPRC
-    precision, recall, thresh_pr = precision_recall_curve(y_test, model_predict)
+    precision, recall, thresh_pr = precision_recall_curve(y_true, model_predict)
     prc_auc = auc(recall, precision)
 
     plt.plot(recall, precision)
@@ -81,15 +83,15 @@ def evaluate(model_predict, y_test, plot_directory):
     rng = np.random.RandomState(rng_seed)
     for _ in range(n_bootstraps):
         indices = rng.randint(0, len(model_predict), len(model_predict))
-        if len(np.unique(y_test[indices])) < 2:
+        if len(np.unique(y_true[indices])) < 2:
             # need both classes for ROC/AUPRC
             continue
 
-        fpr_b, tpr_b, _ = roc_curve(y_test[indices], model_predict[indices])
+        fpr_b, tpr_b, _ = roc_curve(y_true[indices], model_predict[indices])
         auroc_score = auc(fpr_b, tpr_b)
 
         precision_b, recall_b, _ = precision_recall_curve(
-            y_test[indices], model_predict[indices]
+            y_true[indices], model_predict[indices]
         )
         auprc_score = auc(recall_b, precision_b)
 
@@ -146,6 +148,7 @@ def training_and_testing(
     cohort="pooled",
     remove_under65_in_train=True,
     filter_nan=True,
+    subdirectory_suffix="",
 ):
     """
     Train and evaluate a model for a given:
@@ -157,11 +160,12 @@ def training_and_testing(
     """
 
     # subdir name: e.g. 'unbiased_A_predwin_5_sampling_1'
-    subdirectory = "{}_{}_predwin_{}_sampling_{}".format(
+    subdirectory = "{}_{}_predwin_{}_sampling_{}{}".format(
         data_selection_method,
         cohort,
         int(pred_window),
         str(sampling_rate).replace(".", ""),
+        subdirectory_suffix,
     )
 
     ########################################
@@ -208,7 +212,7 @@ def training_and_testing(
         if not os.path.exists(run_dir):
             os.makedirs(run_dir)
 
-        output_tmp = os.path.join(run_dir, "model.hdf5")
+        output_tmp = os.path.join(run_dir, "weights.h5")
 
         class_weights_arr = class_weight.compute_class_weight(
             "balanced", classes=np.unique(y_train), y=y_train
@@ -221,6 +225,7 @@ def training_and_testing(
                 filepath=output_tmp,
                 verbose=1,
                 save_best_only=True,
+                save_weights_only=True,
             ),
             EarlyStopping(
                 monitor="val_loss", patience=50, verbose=1, mode="auto"
@@ -458,7 +463,7 @@ def training_and_testing(
             model = ut.load_lstm_model_architecture_3channel(
                 sample_x=x_test_total
             )
-            output_tmp = os.path.join(run_dir, "weights.hdf5")
+            output_tmp = os.path.join(run_dir, "weights.h5")
 
             class_weights_arr = class_weight.compute_class_weight(
                 class_weight="balanced", classes=np.unique(y_train), y=y_train
@@ -471,6 +476,7 @@ def training_and_testing(
                     filepath=output_tmp,
                     verbose=1,
                     save_best_only=True,
+                    save_weights_only=True,
                 ),
                 EarlyStopping(
                     monitor="val_loss", patience=50, verbose=1, mode="auto"
@@ -718,6 +724,7 @@ for kf in range(10):
             cohort=cohort,
             remove_under65_in_train=True,
             filter_nan=True,
+            subdirectory_suffix=f"_kf{kf}",
         )
 
         print(
